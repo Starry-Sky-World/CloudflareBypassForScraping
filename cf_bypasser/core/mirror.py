@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import traceback
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, AsyncIterator, Union, Mapping, Callable
 from urllib.parse import urlparse, urljoin
 
 from curl_cffi.requests import AsyncSession
@@ -13,6 +13,17 @@ from cf_bypasser.utils.misc import md5_hash
 
 class RequestMirror:
     """Handles dynamic request mirroring with Cloudflare bypass."""
+
+    _HOP_BY_HOP_HEADERS = {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
     
     def __init__(self, bypasser: CamoufoxBypasser = None):
         self.bypasser: CamoufoxBypasser = bypasser or CamoufoxBypasser()
@@ -105,7 +116,7 @@ class RequestMirror:
         headers: Dict[str, str],
         body: bytes = None,
         max_retries: int = 2
-    ) -> Tuple[int, Dict[str, str], bytes]:
+    ) -> Tuple[int, Dict[str, str], Union[bytes, AsyncIterator[bytes]], bool]:
         """Mirror the request to the target hostname with CF bypass."""
         
         # Extract hostname, proxy, and bypass cache flag
@@ -113,7 +124,97 @@ class RequestMirror:
         
         if not hostname:
             raise ValueError("x-hostname header is required")
-        
+
+        def should_stream_response(response_headers: Mapping[str, str]) -> bool:
+            content_type = (response_headers.get("content-type") or "").lower()
+            if content_type.startswith("text/event-stream"):
+                return True
+
+            transfer_encoding = (response_headers.get("transfer-encoding") or "").lower()
+            if "chunked" in transfer_encoding:
+                return True
+
+            return False
+
+        def build_forward_headers(
+            response_headers: Mapping[str, str],
+            *,
+            content_length: Optional[int],
+            streaming: bool,
+        ) -> Dict[str, str]:
+            forwarded: Dict[str, str] = {}
+            for key, value in response_headers.items():
+                key_lower = key.lower()
+                if key_lower in self._HOP_BY_HOP_HEADERS:
+                    continue
+                if key_lower in {"content-length", "transfer-encoding"}:
+                    continue
+                if key_lower == "content-encoding":
+                    forwarded[key] = "identity"
+                    continue
+                forwarded[key] = value
+
+            if not streaming and content_length is not None:
+                forwarded["content-length"] = str(content_length)
+
+            return forwarded
+
+        async def aclose_response(resp: Any) -> None:
+            try:
+                aclose = getattr(resp, "aclose", None)
+                if callable(aclose):
+                    await aclose()
+                    return
+            except Exception:
+                pass
+            try:
+                close = getattr(resp, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
+
+        def get_stream_iter_factory(resp: Any) -> Optional[Callable[[], AsyncIterator[bytes]]]:
+            aiter_bytes = getattr(resp, "aiter_bytes", None)
+            if callable(aiter_bytes):
+                return lambda: aiter_bytes()
+
+            aiter_content = getattr(resp, "aiter_content", None)
+            if callable(aiter_content):
+                def factory() -> AsyncIterator[bytes]:
+                    try:
+                        return aiter_content()
+                    except TypeError:
+                        return aiter_content(chunk_size=65536)
+
+                return factory
+
+            iter_content = getattr(resp, "iter_content", None)
+            if callable(iter_content):
+                import anyio
+
+                def factory() -> AsyncIterator[bytes]:
+                    try:
+                        iterator = iter_content(chunk_size=65536)
+                    except TypeError:
+                        iterator = iter_content()
+
+                    async def gen() -> AsyncIterator[bytes]:
+                        try:
+                            while True:
+                                chunk = await anyio.to_thread.run_sync(lambda: next(iterator, b""))
+                                if not chunk:
+                                    break
+                                yield chunk
+                        finally:
+                            await aclose_response(resp)
+
+                    return gen()
+
+                return factory
+
+            return None
+
         for attempt in range(max_retries + 1):
             try:
                 logging.info(f"Mirroring {method} request to {hostname}{path} (attempt {attempt + 1}/{max_retries + 1})")
@@ -158,23 +259,40 @@ class RequestMirror:
                 # Get session
                 session = await self.get_session(hostname, proxy)
                 
-                # Make the request
-                response = await session.request(
-                    method=method,
-                    url=target_url,
-                    headers=clean_headers,
-                    data=body,
-                    allow_redirects=False  # Let the client handle redirects
-                )
+                # Make the request (prefer streaming response if supported by the client)
+                try:
+                    response = await session.request(
+                        method=method,
+                        url=target_url,
+                        headers=clean_headers,
+                        data=body,
+                        allow_redirects=False,  # Let the client handle redirects
+                        stream=True,
+                    )
+                except TypeError:
+                    response = await session.request(
+                        method=method,
+                        url=target_url,
+                        headers=clean_headers,
+                        data=body,
+                        allow_redirects=False,  # Let the client handle redirects
+                    )
                 
                 # Convert response headers to dict
                 response_headers = dict(response.headers)
-                response_content = response.content
                 status_code = response.status_code
-                
+
+                streaming = should_stream_response(response_headers)
+
+                if streaming:
+                    stream_factory = get_stream_iter_factory(response)
+                    if stream_factory is None:
+                        streaming = False
+
                 # Check if we got a 403 Forbidden response
                 if status_code == 403 and attempt < max_retries:
                     logging.warning(f"Got 403 Forbidden from {hostname}, invalidating cache and retrying...")
+                    await aclose_response(response)
                     
                     # Invalidate the cached cookies for this hostname
                     parsed_hostname = urlparse(target_url).netloc
@@ -184,18 +302,31 @@ class RequestMirror:
                     # Wait a bit before retrying
                     await asyncio.sleep(.5)
                     continue
-                
-                # remove the Content-Encoding and Content-Length headers
-                final_headers = {}
-                for k, v in response_headers.items():
-                    k_lower = k.lower()
-                    if k_lower == "content-encoding":
-                        final_headers[k] = "identity"
-                    elif k_lower == "content-length":
-                        final_headers[k] = str(len(response.content))
-                
+
+                if streaming:
+                    stream_iter = stream_factory()
+                    final_headers = build_forward_headers(response_headers, content_length=None, streaming=True)
+
+                    async def body_gen() -> AsyncIterator[bytes]:
+                        try:
+                            async for chunk in stream_iter:
+                                yield chunk
+                        finally:
+                            await aclose_response(response)
+
+                    logging.info(f"Request to {hostname} completed with status {status_code} (streaming)")
+                    return status_code, final_headers, body_gen(), True
+
+                response_content = response.content
+                final_headers = build_forward_headers(
+                    response_headers,
+                    content_length=len(response_content),
+                    streaming=False,
+                )
+
                 logging.info(f"Request to {hostname} completed with status {status_code}")
-                return status_code, final_headers, response_content
+                await aclose_response(response)
+                return status_code, final_headers, response_content, False
                 
             except Exception as e:
                 if attempt < max_retries:

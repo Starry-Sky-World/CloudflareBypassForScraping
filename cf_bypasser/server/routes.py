@@ -6,7 +6,7 @@ from typing import Optional, AsyncGenerator
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response, Query, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from cf_bypasser.core.bypasser import CamoufoxBypasser
 from cf_bypasser.core.mirror import RequestMirror
@@ -335,7 +335,7 @@ def setup_routes(app: FastAPI):
             mirror = global_mirror or RequestMirror(global_bypasser)
             
             # Mirror the request
-            status_code, response_headers, response_content = await mirror.mirror_request(
+            status_code, response_headers, response_body, is_streaming = await mirror.mirror_request(
                 method=request.method,
                 path=f"/{path}" if path else "/",
                 query_string=query_string,
@@ -347,19 +347,26 @@ def setup_routes(app: FastAPI):
             
             # Log response info
             logger.info(f"Request to {hostname} completed with status {status_code} in {processing_time}ms")
-            logger.info(f"Response size: {len(response_content)} bytes")
-            
-            # Create response with proper headers
-            response = Response(
-                content=response_content,
-                status_code=status_code,
-                headers=response_headers
-            )
+            if not is_streaming:
+                logger.info(f"Response size: {len(response_body)} bytes")
+                response = Response(
+                    content=response_body,
+                    status_code=status_code,
+                    headers=response_headers
+                )
+            else:
+                logger.info("Response size: (streaming)")
+                response = StreamingResponse(
+                    response_body,
+                    status_code=status_code,
+                    headers=response_headers
+                )
             
             # Add custom headers for debugging
             response.headers["x-cf-bypasser-version"] = "2.0.0"
             response.headers["x-processing-time-ms"] = str(processing_time)
             response.headers["x-cache-bypassed"] = str(bypass_cache).lower()
+            response.headers["x-streaming"] = str(is_streaming).lower()
             
             return response
 
